@@ -1,0 +1,1 @@
+If writing a git commit message, do NOT include the "Co-authored-by: Copilot" string 

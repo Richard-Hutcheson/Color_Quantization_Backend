@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 
-from src.routers import health
+from src.routers import health, images
 
-app = FastAPI(title="Color Quantization API")
+app = FastAPI(title="Paint By Numbers API")
 
 app.include_router(health.router)
+app.include_router(images.router)

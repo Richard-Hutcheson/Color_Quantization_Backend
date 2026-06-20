@@ -21,3 +21,6 @@ build/
 
 # macOS
 .DS_Store
+
+# Output files
+output/dominant_color_palette/

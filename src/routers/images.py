@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Form, HTTPException, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 
-from src.services.images import build_palette_image, extract_dominant_colors
+from src.services.images import build_filled_paint_by_numbers_image, build_paint_by_numbers_image, build_palette_image, extract_dominant_colors
 
 router = APIRouter(prefix="/api")
 
@@ -38,7 +38,9 @@ async def post_images(
 
     try:
         result = extract_dominant_colors(image_bytes, color_count)
-        build_palette_image(result.colors)
+        build_palette_image(result.response.colors)
+        build_paint_by_numbers_image(result.full_image, result.label_map, result.response.colors)
+        build_filled_paint_by_numbers_image(result.full_image, result.label_map, result.response.colors)
     except Exception as exc:
         raise HTTPException(
             status_code=500,

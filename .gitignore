@@ -23,4 +23,6 @@ build/
 .DS_Store
 
 # Output files
-output/dominant_color_palette/
+output/*
+
+plan.md

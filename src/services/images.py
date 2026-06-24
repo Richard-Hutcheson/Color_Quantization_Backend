@@ -1,3 +1,4 @@
+import base64
 import io
 import math
 from dataclasses import dataclass
@@ -7,9 +8,11 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy.ndimage import distance_transform_edt
+from scipy.optimize import nnls
+from skimage.color import lab2rgb, rgb2lab
 from sklearn.cluster import KMeans
 
-from src.models.images import DominantColor, ImagesResponse
+from src.models.images import AchievedColor, DominantColor, ImagesResponse, MixRecipe, PaintColor, PaletteEntry
 
 # Images are downsampled to this size (longest side) before clustering
 # to keep KMeans fast regardless of the original resolution.
@@ -161,12 +164,23 @@ def build_palette_image(colors: list[DominantColor]) -> None:
     print(f"Palette image saved to {output_path}")
 
 
+def build_color_palette_data(colors: list[DominantColor]) -> dict[str, PaletteEntry]:
+    """
+    Return the dominant color palette as a dict keyed by the 1-based number
+    that is stamped in the paint-by-numbers image.
+    """
+    return {
+        str(idx + 1): PaletteEntry(r=color.r, g=color.g, b=color.b)
+        for idx, color in enumerate(colors)
+    }
+
+
 def build_paint_by_numbers_image(
     full_image: Image.Image,
     label_map: np.ndarray,
     colors: list[DominantColor],
     blob_centers: list[list[tuple[int, int]]],
-) -> None:
+) -> str:
     """
     Generate a paint-by-numbers overlay at the original image resolution.
 
@@ -219,8 +233,13 @@ def build_paint_by_numbers_image(
 
     _PBN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_path = _PBN_OUTPUT_DIR / "pbn.jpg"
-    Image.fromarray(overlay).save(output_path, format="JPEG", quality=95)
+    pil_image = Image.fromarray(overlay)
+    pil_image.save(output_path, format="JPEG", quality=95)
     print(f"Paint-by-numbers image saved to {output_path}")
+
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format="JPEG", quality=95)
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
 def build_filled_paint_by_numbers_image(
@@ -228,7 +247,7 @@ def build_filled_paint_by_numbers_image(
     label_map: np.ndarray,
     colors: list[DominantColor],
     blob_centers: list[list[tuple[int, int]]],
-) -> None:
+) -> str:
     """
     Generate a color-filled version of the paint-by-numbers image.
 
@@ -280,8 +299,13 @@ def build_filled_paint_by_numbers_image(
 
     _PBN_FILLED_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_path = _PBN_FILLED_OUTPUT_DIR / "pbn_filled.jpg"
-    Image.fromarray(overlay).save(output_path, format="JPEG", quality=95)
+    pil_image = Image.fromarray(overlay)
+    pil_image.save(output_path, format="JPEG", quality=95)
     print(f"Filled paint-by-numbers image saved to {output_path}")
+
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format="JPEG", quality=95)
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
 def compute_blob_centers(
@@ -318,6 +342,55 @@ def compute_blob_centers(
             blob_centers.append(max_loc)
         centers.append(blob_centers)
     return centers
+
+
+def compute_mix_recipe(target: DominantColor, palette: list[PaintColor]) -> MixRecipe:
+    """
+    Compute the paint mixing recipe that best approximates `target` using the
+    colors in `palette`.
+
+    The solver works in LAB color space so that the least-squares minimisation
+    is perceptually uniform.  Non-Negative Least Squares (NNLS) is used so that
+    every weight is ≥ 0 — you cannot use a negative amount of paint.
+
+    Returns a MixRecipe with:
+    - percentages: integer 0–100 for each paint, always summing to 100
+    - achieved_color: the color you actually get by mixing those percentages
+    """
+    # skimage expects float64 RGB in [0, 1] with shape (1, 1, 3)
+    def _to_lab(r: int, g: int, b: int) -> np.ndarray:
+        rgb = np.array([[[r / 255.0, g / 255.0, b / 255.0]]], dtype=np.float64)
+        return rgb2lab(rgb).reshape(3)
+
+    target_lab = _to_lab(target.r, target.g, target.b)
+    palette_lab = np.array([_to_lab(p.r, p.g, p.b) for p in palette])  # (num_paints, 3)
+
+    # Solve: palette_lab.T @ weights ≈ target_lab, weights ≥ 0
+    weights, _ = nnls(palette_lab.T, target_lab)
+
+    total = weights.sum()
+    if total == 0:
+        weights = np.ones(len(palette), dtype=np.float64)
+        total = float(len(palette))
+
+    normalized = weights / total
+
+    # Largest-remainder rounding so percentages always sum to exactly 100
+    raw = normalized * 100.0
+    floors = np.floor(raw).astype(int)
+    remainders = raw - floors
+    deficit = 100 - floors.sum()
+    top_indices = np.argsort(remainders)[::-1][:deficit]
+    floors[top_indices] += 1
+    percentages = {p.name: int(floors[i]) for i, p in enumerate(palette)}
+
+    # Reconstruct the achieved color from the normalized weights
+    achieved_lab = palette_lab.T @ normalized  # shape (3,)
+    achieved_rgb_float = lab2rgb(achieved_lab.reshape(1, 1, 3)).reshape(3)
+    achieved_rgb = np.clip(np.round(achieved_rgb_float * 255), 0, 255).astype(int)
+    achieved_color = AchievedColor(r=int(achieved_rgb[0]), g=int(achieved_rgb[1]), b=int(achieved_rgb[2]))
+
+    return MixRecipe(percentages=percentages, achieved_color=achieved_color)
 
 
 def _absorb_small_blobs(label_map: np.ndarray, min_blob_px: int) -> np.ndarray:

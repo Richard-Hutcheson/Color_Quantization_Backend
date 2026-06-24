@@ -30,13 +30,6 @@ _PBN_FILLED_OUTPUT_DIR = Path(__file__).parents[2] / "output" / "paint_by_number
 _CLUSTER_BLUR_KERNEL = 15
 _CLUSTER_BLUR_SIGMA = 3.0
 
-# Median blur applied to the label map after upscaling to full resolution.
-# Each pixel takes the most common label among its neighbors, which dissolves
-# small isolated islands without shifting the main region boundaries.
-# Applied this many times in succession; each pass removes finer islands.
-_LABEL_MEDIAN_KERNEL = 21  # must be odd
-_LABEL_MEDIAN_PASSES = 2
-
 # Blobs smaller than this fraction of total image pixels are skipped for number placement
 _MIN_BLOB_AREA_RATIO = 0.001
 
@@ -94,15 +87,15 @@ def extract_dominant_colors(image_bytes: bytes, color_count: int) -> ExtractionR
         print(f"  RGB({color.r}, {color.g}, {color.b}), HEX: {color.hex}")
 
     # Reuse the labels KMeans already computed on the downsampled cluster image.
-    # Reshape into a 2-D label map, scale up to full resolution with nearest-neighbor
-    # interpolation, then apply repeated median blur passes to dissolve small islands.
+    # Reshape into a 2-D label map and scale up to full resolution with nearest-neighbor
+    # interpolation, then absorb small isolated islands into their nearest large neighbor.
     cluster_h, cluster_w = cluster_array.shape[:2]
     cluster_label_map = kmeans.labels_.reshape(cluster_h, cluster_w).astype(np.uint8)
     img_w, img_h = full_image.size
     label_map = cv2.resize(cluster_label_map, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
-    for _ in range(_LABEL_MEDIAN_PASSES):
-        label_map = cv2.medianBlur(label_map, _LABEL_MEDIAN_KERNEL)
     label_map = label_map.astype(np.int32)
+    min_blob_px = max(1, int(img_h * img_w * _MIN_BLOB_AREA_RATIO))
+    label_map = _absorb_small_blobs(label_map, min_blob_px)
 
     return ExtractionResult(
         response=ImagesResponse(color_count=color_count, colors=colors),
@@ -143,6 +136,7 @@ def build_palette_image(colors: list[DominantColor]) -> None:
     except TypeError:
         font = ImageFont.load_default()
 
+    # Draw each color as a swatch with its RGB and hex label, placed in grid order
     for i, color in enumerate(colors):
         col = i % cols
         row = i // cols
@@ -171,25 +165,20 @@ def build_paint_by_numbers_image(
     full_image: Image.Image,
     label_map: np.ndarray,
     colors: list[DominantColor],
+    blob_centers: list[list[tuple[int, int]]],
 ) -> None:
     """
     Generate a paint-by-numbers overlay at the original image resolution.
 
     The output is a white-background image with:
     - Black borders wherever two adjacent pixels belong to different color clusters.
-    - A number placed inside every region. Blobs too small to receive a number are
-      absorbed into the nearest large neighbor so no unlabeled islands remain.
+    - A number placed inside every blob, using pre-computed interior points from
+      blob_centers (see compute_blob_centers).
 
     The number-to-RGB key is printed to the console.
     The image is saved to output/paint_by_numbers/pbn.jpg.
     """
     img_h, img_w = label_map.shape
-    total_pixels = img_h * img_w
-    min_blob_px = max(1, int(total_pixels * _MIN_BLOB_AREA_RATIO))
-
-    # Remove small islands: any blob below min_blob_px is absorbed into the
-    # nearest large-enough neighboring region so every visible area gets a number.
-    label_map = _absorb_small_blobs(label_map, min_blob_px)
 
     # White background
     overlay = np.full((img_h, img_w, 3), 255, dtype=np.uint8)
@@ -200,6 +189,9 @@ def build_paint_by_numbers_image(
     v_edge = label_map[:, :-1] != label_map[:, 1:]  # shape (H, W-1)
 
     border = np.zeros((img_h, img_w), dtype=bool)
+    # Expand each edge onto both neighboring pixels so the border appears as a
+    # 2-pixel-wide line straddling the true region boundary rather than a 1-pixel
+    # line sitting entirely on one side of it.
     border[:-1, :] |= h_edge
     border[1:, :] |= h_edge
     border[:, :-1] |= v_edge
@@ -207,25 +199,13 @@ def build_paint_by_numbers_image(
 
     overlay[border] = [0, 0, 0]
 
-    # Print the key and place numbers inside each qualifying blob
+    # For each color, stamp its 1-based number at the interior point of every blob
     print("Paint-by-numbers key:")
     for idx, color in enumerate(colors):
         number = idx + 1
         print(f"  {number}: RGB({color.r}, {color.g}, {color.b})")
-
-        mask = (label_map == idx).astype(np.uint8)
-        num_labels, label_img, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
-        # Component label 0 is the background (pixels where mask == 0); skip it.
-        # All remaining blobs are guaranteed large enough after _absorb_small_blobs.
-        for comp in range(1, num_labels):
-            # Use distanceTransform to find the most interior point of this blob.
-            # The centroid of a concave shape can fall outside the region entirely;
-            # the distance-transform peak is always safely inside it.
-            comp_mask = (label_img == comp).astype(np.uint8)
-            dist = cv2.distanceTransform(comp_mask, cv2.DIST_L2, 5)
-            _, _, _, max_loc = cv2.minMaxLoc(dist)
-            cx, cy = max_loc
+        # Each entry in blob_centers[idx] is the most interior (cx, cy) of one connected blob
+        for cx, cy in blob_centers[idx]:
             cv2.putText(
                 overlay,
                 str(number),
@@ -247,34 +227,31 @@ def build_filled_paint_by_numbers_image(
     full_image: Image.Image,
     label_map: np.ndarray,
     colors: list[DominantColor],
+    blob_centers: list[list[tuple[int, int]]],
 ) -> None:
     """
     Generate a color-filled version of the paint-by-numbers image.
 
-    Each region is flood-filled with its cluster color. Black borders are drawn
-    at region boundaries. Numbers are placed at the most interior point of each
-    blob using a contrasting color (white on dark regions, black on light ones)
-    for readability.
+    Each region is filled with its cluster color via a vectorized LUT lookup.
+    Black borders are drawn at region boundaries. Numbers are placed using
+    pre-computed interior points from blob_centers (see compute_blob_centers),
+    with a luminance-based contrasting text color.
 
     The image is saved to output/paint_by_numbers_filled/pbn_filled.jpg.
     """
     img_h, img_w = label_map.shape
-    total_pixels = img_h * img_w
-    min_blob_px = max(1, int(total_pixels * _MIN_BLOB_AREA_RATIO))
 
-    label_map = _absorb_small_blobs(label_map, min_blob_px)
+    # Vectorized color fill: build a (color_count, 3) LUT and index it with
+    # the label map in one operation instead of N per-label mask writes.
+    color_lut = np.array([[c.r, c.g, c.b] for c in colors], dtype=np.uint8)
+    overlay = color_lut[label_map]
 
-    # Fill each pixel with its cluster color
-    overlay = np.zeros((img_h, img_w, 3), dtype=np.uint8)
-    for idx, color in enumerate(colors):
-        mask = label_map == idx
-        overlay[mask] = [color.r, color.g, color.b]
-
-    # Draw black borders at region boundaries (same logic as PBN)
+    # Draw black borders at region boundaries
     h_edge = label_map[:-1, :] != label_map[1:, :]
     v_edge = label_map[:, :-1] != label_map[:, 1:]
 
     border = np.zeros((img_h, img_w), dtype=bool)
+    # Expand each edge onto both neighboring pixels (same logic as build_paint_by_numbers_image)
     border[:-1, :] |= h_edge
     border[1:, :] |= h_edge
     border[:, :-1] |= v_edge
@@ -282,21 +259,14 @@ def build_filled_paint_by_numbers_image(
 
     overlay[border] = [0, 0, 0]
 
-    # Place numbers inside each blob using a contrasting text color
+    # For each color, stamp its number at the interior point of every blob using a contrasting color
     for idx, color in enumerate(colors):
         number = idx + 1
         # Perceived luminance — pick white text on dark fills, black on light fills
         luminance = 0.299 * color.r + 0.587 * color.g + 0.114 * color.b
         text_color = (255, 255, 255) if luminance < 128 else (0, 0, 0)
-
-        mask = (label_map == idx).astype(np.uint8)
-        num_labels, label_img, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
-        for comp in range(1, num_labels):
-            comp_mask = (label_img == comp).astype(np.uint8)
-            dist = cv2.distanceTransform(comp_mask, cv2.DIST_L2, 5)
-            _, _, _, max_loc = cv2.minMaxLoc(dist)
-            cx, cy = max_loc
+        # Each entry in blob_centers[idx] is the most interior (cx, cy) of one connected blob
+        for cx, cy in blob_centers[idx]:
             cv2.putText(
                 overlay,
                 str(number),
@@ -314,6 +284,42 @@ def build_filled_paint_by_numbers_image(
     print(f"Filled paint-by-numbers image saved to {output_path}")
 
 
+def compute_blob_centers(
+    label_map: np.ndarray,
+    colors: list[DominantColor],
+) -> list[list[tuple[int, int]]]:
+    """
+    For each color index, find the most interior point of every blob in the label map.
+
+    Returns a list (one entry per color) of lists of (cx, cy) positions — one per
+    connected blob. Uses distanceTransform to find the peak interior point, which is
+    always safely inside even concave regions.
+
+    Computed once and shared between build_paint_by_numbers_image and
+    build_filled_paint_by_numbers_image to avoid redundant connected-component
+    analysis and distance transforms.
+    """
+    centers: list[list[tuple[int, int]]] = []
+    # Iterate over each color label to find all disconnected blobs of that color
+    for idx in range(len(colors)):
+        mask = (label_map == idx).astype(np.uint8)
+        # connectedComponentsWithStats labels each disconnected blob; component 0 is always
+        # the background (pixels where mask == 0), so real blobs start at index 1.
+        num_labels, label_img, _, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        blob_centers: list[tuple[int, int]] = []
+        # Find the most interior point of each blob via the distance transform peak
+        for comp in range(1, num_labels):
+            comp_mask = (label_img == comp).astype(np.uint8)
+            # distanceTransform assigns each foreground pixel its Euclidean distance to the
+            # nearest background pixel; the maximum is the point furthest from any edge —
+            # always safely inside the region even for concave shapes.
+            dist = cv2.distanceTransform(comp_mask, cv2.DIST_L2, 5)
+            _, _, _, max_loc = cv2.minMaxLoc(dist)
+            blob_centers.append(max_loc)
+        centers.append(blob_centers)
+    return centers
+
+
 def _absorb_small_blobs(label_map: np.ndarray, min_blob_px: int) -> np.ndarray:
     """
     Remove blobs smaller than `min_blob_px` by overwriting their pixels with the
@@ -327,9 +333,11 @@ def _absorb_small_blobs(label_map: np.ndarray, min_blob_px: int) -> np.ndarray:
 
     # Mark every pixel that belongs to a blob large enough to receive a number
     valid = np.zeros(label_map.shape, dtype=bool)
+    # Scan every blob of every color; flag pixels in blobs that meet the size threshold
     for idx in range(num_colors):
         mask = (label_map == idx).astype(np.uint8)
         n, label_img, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        # Component 0 is background; skip it. For each real blob, check its pixel area.
         for comp in range(1, n):
             if stats[comp, cv2.CC_STAT_AREA] >= min_blob_px:
                 valid |= label_img == comp
@@ -337,8 +345,11 @@ def _absorb_small_blobs(label_map: np.ndarray, min_blob_px: int) -> np.ndarray:
     if valid.all():
         return label_map
 
-    # For every invalid pixel, copy the label of the nearest valid pixel
+    # distance_transform_edt with return_indices=True returns the (row, col) coordinates
+    # of the nearest True (valid) pixel for every False (invalid) pixel.
     _, nearest = distance_transform_edt(~valid, return_indices=True)
+    # nearest[0] and nearest[1] are the row and column index arrays; use them to copy
+    # the label of the nearest valid pixel into every invalid pixel in one vectorized step.
     label_map[~valid] = label_map[nearest[0][~valid], nearest[1][~valid]]
     return label_map
 

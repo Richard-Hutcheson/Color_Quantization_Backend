@@ -38,8 +38,10 @@ _MIN_BLOB_AREA_RATIO = 0.001
 
 # cv2.putText parameters for region numbers
 _PBN_FONT = cv2.FONT_HERSHEY_SIMPLEX
-_PBN_FONT_SCALE = 0.8
-_PBN_FONT_THICKNESS = 1
+_PBN_FONT_SCALE = 1.4
+_PBN_FONT_THICKNESS = 2
+_PBN_TEXT_MARGIN = 12
+_PBN_EDGE_INWARD_MIN_DIST_RATIO = 0.65
 
 
 @dataclass
@@ -220,10 +222,17 @@ def build_paint_by_numbers_image(
         print(f"  {number}: RGB({color.r}, {color.g}, {color.b})")
         # Each entry in blob_centers[idx] is the most interior (cx, cy) of one connected blob
         for cx, cy in blob_centers[idx]:
+            text_origin = _compute_pbn_text_origin(
+                cx,
+                cy,
+                str(number),
+                img_w,
+                img_h,
+            )
             cv2.putText(
                 overlay,
                 str(number),
-                (cx, cy),
+                text_origin,
                 _PBN_FONT,
                 _PBN_FONT_SCALE,
                 (0, 0, 0),
@@ -286,10 +295,17 @@ def build_filled_paint_by_numbers_image(
         text_color = (255, 255, 255) if luminance < 128 else (0, 0, 0)
         # Each entry in blob_centers[idx] is the most interior (cx, cy) of one connected blob
         for cx, cy in blob_centers[idx]:
+            text_origin = _compute_pbn_text_origin(
+                cx,
+                cy,
+                str(number),
+                img_w,
+                img_h,
+            )
             cv2.putText(
                 overlay,
                 str(number),
-                (cx, cy),
+                text_origin,
                 _PBN_FONT,
                 _PBN_FONT_SCALE,
                 text_color,
@@ -313,33 +329,49 @@ def compute_blob_centers(
     colors: list[DominantColor],
 ) -> list[list[tuple[int, int]]]:
     """
-    For each color index, find the most interior point of every blob in the label map.
+    For each color index, choose a label anchor point for every blob in the label map.
 
     Returns a list (one entry per color) of lists of (cx, cy) positions — one per
-    connected blob. Uses distanceTransform to find the peak interior point, which is
-    always safely inside even concave regions.
+    connected blob. Interior blobs use the distance-transform peak (furthest from
+    boundaries). Blobs touching the image border use an inward-biased anchor that
+    stays interior while shifting closer to the image center.
 
     Computed once and shared between build_paint_by_numbers_image and
     build_filled_paint_by_numbers_image to avoid redundant connected-component
     analysis and distance transforms.
     """
+    img_h, img_w = label_map.shape
+    y_coords, x_coords = np.indices((img_h, img_w))
+    center_x = (img_w - 1) / 2.0
+    center_y = (img_h - 1) / 2.0
+    center_dist_map = np.sqrt((x_coords - center_x) ** 2 + (y_coords - center_y) ** 2)
+
     centers: list[list[tuple[int, int]]] = []
     # Iterate over each color label to find all disconnected blobs of that color
     for idx in range(len(colors)):
         mask = (label_map == idx).astype(np.uint8)
         # connectedComponentsWithStats labels each disconnected blob; component 0 is always
         # the background (pixels where mask == 0), so real blobs start at index 1.
-        num_labels, label_img, _, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        num_labels, label_img, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         blob_centers: list[tuple[int, int]] = []
-        # Find the most interior point of each blob via the distance transform peak
+        # Choose an anchor per blob. Edge-touching blobs are biased inward.
         for comp in range(1, num_labels):
             comp_mask = (label_img == comp).astype(np.uint8)
             # distanceTransform assigns each foreground pixel its Euclidean distance to the
             # nearest background pixel; the maximum is the point furthest from any edge —
             # always safely inside the region even for concave shapes.
             dist = cv2.distanceTransform(comp_mask, cv2.DIST_L2, 5)
-            _, _, _, max_loc = cv2.minMaxLoc(dist)
-            blob_centers.append(max_loc)
+            left = int(stats[comp, cv2.CC_STAT_LEFT])
+            top = int(stats[comp, cv2.CC_STAT_TOP])
+            width = int(stats[comp, cv2.CC_STAT_WIDTH])
+            height = int(stats[comp, cv2.CC_STAT_HEIGHT])
+            edge_touching = (
+                left == 0
+                or top == 0
+                or (left + width) == img_w
+                or (top + height) == img_h
+            )
+            blob_centers.append(_select_blob_anchor(comp_mask, dist, edge_touching, center_dist_map))
         centers.append(blob_centers)
     return centers
 
@@ -425,6 +457,68 @@ def _absorb_small_blobs(label_map: np.ndarray, min_blob_px: int) -> np.ndarray:
     # the label of the nearest valid pixel into every invalid pixel in one vectorized step.
     label_map[~valid] = label_map[nearest[0][~valid], nearest[1][~valid]]
     return label_map
+
+
+def _compute_pbn_text_origin(
+    cx: int,
+    cy: int,
+    text: str,
+    img_w: int,
+    img_h: int,
+) -> tuple[int, int]:
+    """Return a bottom-left text origin centered on (cx, cy) and clamped inward."""
+    (text_w, text_h), baseline = cv2.getTextSize(
+        text,
+        _PBN_FONT,
+        _PBN_FONT_SCALE,
+        _PBN_FONT_THICKNESS,
+    )
+
+    # cv2.putText expects a bottom-left baseline origin.
+    x = int(round(cx - text_w / 2))
+    y = int(round(cy + text_h / 2))
+
+    min_x = _PBN_TEXT_MARGIN
+    max_x = img_w - text_w - _PBN_TEXT_MARGIN
+    min_y = text_h + _PBN_TEXT_MARGIN
+    max_y = img_h - baseline - _PBN_TEXT_MARGIN
+
+    if max_x < min_x:
+        x = max(0, img_w - text_w)
+    else:
+        x = max(min_x, min(x, max_x))
+
+    if max_y < min_y:
+        y = min(img_h - baseline, max(text_h, y))
+    else:
+        y = max(min_y, min(y, max_y))
+
+    return (x, y)
+
+
+def _select_blob_anchor(
+    comp_mask: np.ndarray,
+    dist: np.ndarray,
+    edge_touching: bool,
+    center_dist_map: np.ndarray,
+) -> tuple[int, int]:
+    """Choose a blob anchor; edge-touching blobs are biased inward."""
+    _, _, _, max_loc = cv2.minMaxLoc(dist)
+    if not edge_touching:
+        return max_loc
+
+    max_dist = float(dist.max())
+    min_allowed_dist = max_dist * _PBN_EDGE_INWARD_MIN_DIST_RATIO
+    eligible = (comp_mask == 1) & (dist >= min_allowed_dist)
+    if not np.any(eligible):
+        eligible = comp_mask == 1
+
+    ys, xs = np.where(eligible)
+    if ys.size == 0:
+        return max_loc
+
+    best_idx = int(np.argmin(center_dist_map[ys, xs]))
+    return (int(xs[best_idx]), int(ys[best_idx]))
 
 
 def _resize_for_clustering(image: Image.Image) -> Image.Image:

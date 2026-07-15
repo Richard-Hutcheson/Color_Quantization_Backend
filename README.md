@@ -15,8 +15,8 @@ This repo is the frontend application of a paint by numbers web application. The
 * Color extraction & remapping
     * scikit-learn — KMeans clustering (extracts palette AND gives you per-pixel labels for remapping)
 * Color mixing recipes
-    * scipy — NNLS solver for calculating how to mix each palette color from R, G, B, White, Black
-    * scikit-image — RGB → LAB color conversion (makes mixing math perceptually accurate)
+    * scipy — constrained optimization for subtractive paint mixing weights
+    * scikit-image — RGB → LAB conversion for perceptual color-distance matching
 
 ## Running the API
 
@@ -34,21 +34,35 @@ The API will be available at `http://localhost:8000`.
 Interactive docs are at `http://localhost:8000/docs`.
 
 ## How It Works
+The backend exposes one main endpoint:
 
-### Finding the Dominant Colors
+`POST /api/images`
 
-1. **Shrink and blur the photo.** The image is scaled down so its longest side is at most 1024 pixels, then a blur is applied. The blur smooths out fine texture and surface detail (think fabric grain or wood patterns) so the algorithm focuses on broad color regions rather than noise.
+The request contains:
+* `image` (JPG or PNG)
+* `color_count` (1–64)
+* optional `palette_json` (custom paint palette)
 
-2. **Group pixels by color similarity (KMeans clustering).** Every pixel is treated as a point in 3D space based on its red, green, and blue values. KMeans clustering partitions all pixels into *N* groups (where *N* is the number of colors you requested), where each group contains pixels that are closest in color to one another. The center of each group is the dominant color for that group.
+### Processing pipeline
+1. Validate upload type and file size.
+2. Load the image in RGB.
+3. Downsample for clustering speed, apply bilateral denoising, and run KMeans to find `color_count` dominant colors.
+4. Reassign every full-resolution pixel to the nearest cluster center for crisp region boundaries.
+5. Clean the label map (small-blob absorption + boundary smoothing) so paint regions are more usable.
+6. For each dominant color, compute a paint recipe from the palette using constrained subtractive mixing optimization.
+7. Build output assets:
+   * dominant color palette image
+   * paint-by-numbers line image (white background + black region edges + region numbers)
+   * filled paint-by-numbers image (regions filled with their assigned dominant colors)
 
-3. **Scale the result back up.** Each pixel in the full-resolution photo gets assigned the label of whichever dominant color it belongs to. Tiny isolated patches that are too small to label are merged into the nearest surrounding color region.
-
-### Building the Paint-by-Numbers Overlay
-
-1. **Find the borders between color regions.** Any pixel that sits next to a pixel belonging to a different color group is considered a border. These borders are drawn black on a white canvas, producing the outline drawing you'd see in a paint-by-numbers kit.
-
-2. **Find a good spot to place each number.** For every disconnected blob of the same color, the algorithm finds the point that is furthest from the blob's edges — the most "interior" spot. This ensures numbers are placed well inside their region rather than right on a border where they'd be hard to read.
-
-3. **Stamp the numbers.** Each color is assigned a number (1, 2, 3, …). That number is printed at the interior point of every blob belonging to that color. The `color_palette` in the API response maps each number to its RGB and hex values so you know which paint to use for each region.
-
-4. **The filled version** follows the same process but fills each region with its actual color before drawing the borders and numbers, giving a preview of what the finished painting will look like.
+### Response payload
+The response includes:
+* `color_count`
+* `colors`: dominant colors with:
+  * RGB + hex
+  * `recipe`:
+    * `percentages` per paint (always sums to 100)
+    * `achieved_color` (the model-predicted mixed result)
+* `paint_by_numbers_image` (base64 JPG)
+* `paint_by_numbers_filled_image` (base64 JPG)
+* `color_palette` (indexed dominant colors for UI display)
